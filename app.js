@@ -1,67 +1,139 @@
 const express = require('express')
 const querystring = require('querystring');
-const port = 3000
 const app = express()
-
-// List of all messages
-let messages = []
-
-// Track last active times for each sender
-let users = {}
+const mongoose = require('mongoose');
+const port = process.env.PORT || 3000
 
 app.use(express.static("./public"))
 app.use(express.json())
+
+// setting up websockets
+const socket = require('socket.io');
+const server = app.listen(port);
+const io = socket(server);
+
+// mlab/heroku stuff
+const dbName = 'klack';
+const DB_USER = 'admin';
+const DB_PASSWORD = 'admin';
+const DB_URI = "ds119306.mlab.com:19306";
+
+
+//mongo stuff
+mongoose.connect(`mongodb://${DB_USER}:${DB_PASSWORD}@${DB_URI}/${dbName}`, () => {
+console.log('connection success')
+})
+const db = mongoose.connection;
+db.on('error', console.error.bind(console, 'connection fuckup'))
+
+//define the schema
+
+const Schema = mongoose.Schema;
+const messageSchema = new Schema({
+    name: String,
+    message: String,
+    timestamp: Number,
+});
+
+//compile a response model from the schema
+const Message = mongoose.model('Message', messageSchema)
+
+// Track last active times for each sender
+const usersTimestamps = {}
 
 // generic comparison function for case-insensitive alphabetic sorting on the name field
 function userSortFn(a, b) {
     var nameA = a.name.toUpperCase(); // ignore upper and lowercase
     var nameB = b.name.toUpperCase(); // ignore upper and lowercase
     if (nameA < nameB) {
-      return -1;
+        return -1;
     }
     if (nameA > nameB) {
-      return 1;
+        return 1;
     }
-  
+    
     // names must be equal
     return 0;      
 }
 
-app.get("/messages", (request, response) => {
-    // get the current time
-    const now = Date.now();
+// Setting up socket endpoints
+io.on('connection', (socket) => {
+    console.log(`Connected on Port: ${port}`)
+    Message.find()
+        .then(messages => {
+            messages.forEach(message => {
+                if (!usersTimestamps[message.name]) {
+                    usersTimestamps[message.name] = message.timestamp
+                } else if (usersTimestamps[message.name] < message.timestamp) {
+                    usersTimestamps[message.name] = message.timestamp
+                }
+            })
+        })
+        .then(() => {
+            const now = Date.now();
+            // consider users active if they have connected (GET or POST) in last 15 seconds
+            const requireActiveSince = now - (15*1000)
+            
+            // create a new list of users with a flag indicating whether they have been active recently
+            usersSimple = Object.keys(usersTimestamps).map((x) => ({name: x, active: (usersTimestamps[x] > requireActiveSince)}))
+            
+            // sort the list of users alphabetically by name
+            usersSimple.sort(userSortFn);
+            usersSimple.filter((a) => (a.name !== usersTimestamps.name))
+            socket.emit('activeUsers', {users: usersSimple})
+        })
+        .catch(err => {
+            console.error(err);
+        })    
 
-    // consider users active if they have connected (GET or POST) in last 15 seconds
-    const requireActiveSince = now - (15*1000)
+    Message.find((err, messages) => {
+        socket.emit('initial', messages);
+    })
+    
 
-    // create a new list of users with a flag indicating whether they have been active recently
-    usersSimple = Object.keys(users).map((x) => ({name: x, active: (users[x] > requireActiveSince)}))
-
-    // sort the list of users alphabetically by name
-    usersSimple.sort(userSortFn);
-    usersSimple.filter((a) => (a.name !== request.query.for))
-
-    // update the requesting user's last access time
-    users[request.query.for] = now;
-
-    // send the latest 40 messages and the full user list, annotated with active flags
-    response.send({messages: messages.slice(-40), users: usersSimple})
+    socket.on('chat', (data) =>{
+        // get the current time
+        const now = Date.now();
+        // consider users active if they have sent a message in last 15 seconds
+        const requireActiveSince = now - (15*1000)
+        
+        // update the requesting user's last access time
+        usersTimestamps[data.name] = now;
+        
+        // create a new list of users with a flag indicating whether they have been active recently
+        usersSimple = Object.keys(usersTimestamps).map((x) => ({name: x, active: (usersTimestamps[x] > requireActiveSince)}))
+        
+        // sort the list of users alphabetically by name
+        usersSimple.sort(userSortFn);
+        usersSimple.filter((a) => (a.name !== data.name))
+        
+        let message = new Message({
+            name: data.name,
+            message: data.message,
+            timestamp: now,
+            
+        })
+        message.save()
+         
+        io.sockets.emit('chat', {message, users: usersSimple})
+    })
+    
+    socket.on('typing', (data) => {
+        socket.broadcast.emit('typing', data);
+    })
+    
+    setInterval((sockets) => {
+        const now = Date.now();
+        // consider users active if their last message was sent in the last 15 seconds
+        const requireActiveSince = now - (15*1000)
+        
+        // create a new list of users with a flag indicating whether they have been active recently
+        usersSimple = Object.keys(usersTimestamps).map((x) => ({name: x, active: (usersTimestamps[x] > requireActiveSince)}))
+        
+        // sort the list of users alphabetically by name
+        usersSimple.sort(userSortFn);
+        usersSimple.filter((a) => (a.name !== usersTimestamps.name))
+        console.log("I'm watching you...")
+        io.sockets.emit('activeUsers', {users: usersSimple})
+    }, 15000)
 })
-
-app.post("/messages", (request, response) => {
-    // add a timestamp to each incoming message.
-    const timestamp = Date.now()
-    request.body.timestamp = timestamp
-
-    // append the new message to the message list
-    messages.push(request.body)
-
-    // update the posting user's last access timestamp (so we know they are active)
-    users[request.body.sender] = timestamp
-
-    // Send back the successful response.
-    response.status(201)
-    response.send(request.body)
-})
-
-app.listen(3000)
